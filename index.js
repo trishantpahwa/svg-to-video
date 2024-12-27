@@ -1,79 +1,106 @@
-let fs = require('fs');
-let child_process = require('child_process');
-let puppeteer = require("puppeteer");
+const fs = require('fs');
+const child_process = require('child_process');
+const puppeteer = require('puppeteer');
 
-const usage = 'usage: node index.js <svgPath> <duration> <fps> <outDir>';
-const imgExtention = 'png';
+const usage = 'Usage: node index.js <svgPath> <duration> <fps> <outDir>';
+const imgExtension = 'png';
 const imgType = 'png';
 
 async function main() {
-    let [nodePath, progPath, svgPath, duration, fps, outDir] = process.argv;
-    if(outDir === undefined) {
-        console.error('outDir is not defined');
+    const [nodePath, progPath, svgPath, durationStr, fpsStr, outDir] = process.argv;
+
+    if (!outDir) {
+        console.error('Error: Output directory (outDir) is not defined.');
         console.log(usage);
         process.exit(2);
     }
-    const svg = fs.readFileSync(svgPath, 'utf-8');
 
-    duration = parseFloat(duration);
-    fps = parseInt(fps);
-    console.log('duration: ' + duration + ' s, fps: ' + fps);
-    const totalFrames = Math.floor(fps * duration);
-    const digits = Math.floor(Math.log10(totalFrames)) + 1;
-    console.log('totalFrames: ' + totalFrames);
+    if (!svgPath || !durationStr || !fpsStr) {
+        console.error('Error: Missing required arguments.');
+        console.log(usage);
+        process.exit(2);
+    }
+
+    const svg = fs.readFileSync(svgPath, 'utf-8');
+    const duration = parseFloat(durationStr);
+    const fps = parseInt(fpsStr);
+
+    console.log(`Duration: ${duration}s, Target FPS: ${fps}`);
+    const totalFrames = Math.floor(60 * duration); // SVG runs at 60 FPS
+    const digits = Math.ceil(Math.log10(totalFrames + 1));
+
+    console.log(`Total Frames to Render: ${totalFrames}`);
+    console.log(`Frame File Name Padding Digits: ${digits}`);
 
     process.chdir(outDir);
     await createFrames(svg, fps, totalFrames, digits);
-    convertToMP4(fps, totalFrames, digits);
+    convertToMP4(fps, digits);
 }
 
 async function createFrames(svg, fps, totalFrames, digits) {
-    svg = svg.replace('--play-state: running;', '--play-state: paused;');
+    const svgPaused = svg.replace('--play-state: running;', '--play-state: paused;');
 
-    let browser = await puppeteer.launch({
+    const browser = await puppeteer.launch({
         headless: true,
-        args: ['--no-sandbox', '--font-render-hinting=none']
+        args: ['--no-sandbox', '--font-render-hinting=none'],
+        executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     });
 
-    let page = await browser.newPage();
-    await page.goto('about:blank');
-    await page.setContent(svg);
+    const page = await browser.newPage();
+    await page.setContent(svgPaused);
 
-    let renderSettings = {
+    const renderSettings = {
         type: imgType,
         omitBackground: false,
     };
 
-    console.log('creating frames');
-    for(let i=1; i <= totalFrames; ++i) {
-        let result = await page.evaluate(function(startVal) {
-            document.getElementsByTagName('svg')[0].style.setProperty('--start', startVal);},
-            '' + ((i-1) / fps) + 's');
-        await page.waitForTimeout(1);
+    console.log('Rendering frames...');
+    for (let i = 1; i <= totalFrames; i++) {
+        const currentTime = ((i - 1) / 60); // SVG frame time in seconds (60 FPS)
+        await page.evaluate(
+            (startTime) => {
+                document.querySelector('svg').style.setProperty('--start', startTime);
+            },
+            `${currentTime}s`
+        );
 
-        let outputElem = await page.$('svg');
-        let prefix = ('' + i).padStart(digits, '0');
-        renderSettings.path = prefix + '.' + imgExtention;
-        await outputElem.screenshot(renderSettings);
-        if(i % fps === 0 || i === totalFrames) {
-            console.log('progress: ' + prefix + ' / ' + totalFrames);
+        const frameNumber = String(i).padStart(digits, '0');
+        renderSettings.path = `${frameNumber}.${imgExtension}`;
+        const svgElement = await page.$('svg');
+        await svgElement.screenshot(renderSettings);
+
+        if (i % fps === 0 || i === totalFrames) {
+            console.log(`Progress: Rendered frame ${frameNumber} of ${totalFrames}`);
         }
     }
 
     await browser.close();
-    return totalFrames, digits;
+    console.log('Frame rendering completed.');
 }
 
-function convertToMP4(fps, totalFrames, digits) {
-    console.log('running ffmpeg')
-    let output = child_process.execFileSync('ffmpeg',
-        ['-hide_banner', '-loglevel', 'warning', '-y',
-            '-framerate', '' + fps,
-            '-i', '%0' + digits + 'd.' + imgExtention,
-            '-c:v', 'libx264', '-vf', 'fps=' + fps, '-pix_fmt', 'yuv420p',
-            'output.mp4'],
-        {'encoding': 'utf8'});
-    console.log(output);
+function convertToMP4(fps, digits) {
+    console.log('Converting frames to MP4...');
+    const args = [
+        '-hide_banner',
+        '-loglevel', 'warning',
+        '-y',
+        '-framerate', '60', // Input frame rate (SVG is 60 FPS)
+        '-i', `%0${digits}d.${imgExtension}`,
+        '-vf', 'scale=iw:ih', // Add scaling filter to fix resolution issues
+        '-c:v', 'libx264',
+        '-r', `${fps}`, // Output frame rate
+        '-pix_fmt', 'yuv420p',
+        'output.mp4',
+    ];
+
+    try {
+        const output = child_process.execFileSync('ffmpeg', args, { encoding: 'utf8' });
+        console.log(output);
+        console.log('MP4 conversion completed.');
+    } catch (err) {
+        console.error('Error during MP4 conversion:', err.message);
+        process.exit(1);
+    }
 }
 
 main();
